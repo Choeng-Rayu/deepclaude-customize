@@ -227,17 +227,46 @@ launch_claude() {
 
     resolve_backend
 
+    echo "  Starting model proxy for $BACKEND..."
+
+    local port_file
+    port_file=$(mktemp)
+    node "$SCRIPT_DIR/proxy/start-proxy.js" "$RESOLVED_URL" "$RESOLVED_KEY" > "$port_file" 2>&1 &
+    PROXY_PID=$!
+
+    local tries=0
+    while [[ $tries -lt 30 ]]; do
+        if [[ -s "$port_file" ]]; then
+            local last_line=$(tail -1 "$port_file")
+            # Check if last line is a number (the port)
+            if [[ "$last_line" =~ ^[0-9]+$ ]]; then
+                break
+            fi
+        fi
+        sleep 0.2
+        tries=$((tries + 1))
+    done
+
+    if [[ ! -s "$port_file" ]]; then
+        echo "ERROR: Proxy failed to start" >&2
+        rm -f "$port_file"
+        exit 1
+    fi
+
+    local proxy_port
+    proxy_port=$(tail -1 "$port_file" | sed 's/\x1b\[[0-9;]*m//g')
+    rm -f "$port_file"
+
+    echo "  Proxy on :$proxy_port -> $RESOLVED_URL"
     echo "  Launching Claude Code via $BACKEND..."
-    echo "  Endpoint: $RESOLVED_URL"
     echo "  Model: $RESOLVED_OPUS (main) + $RESOLVED_HAIKU (subagents)"
     echo ""
 
-    export ANTHROPIC_BASE_URL="$RESOLVED_URL"
-    export ANTHROPIC_AUTH_TOKEN="$RESOLVED_KEY"
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:$proxy_port"
     set_model_env
-    unset ANTHROPIC_API_KEY
+    unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
 
-    exec claude "$@"
+    claude "$@"
 }
 
 launch_remote() {

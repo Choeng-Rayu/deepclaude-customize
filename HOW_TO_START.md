@@ -16,7 +16,9 @@ echo 'export DOUBLEWORD_API_KEY="your api key"' >> ~/.bashrc
 source ~/.bashrc
 ```
 
-### 2. Launch deepclaude
+### 2. Launch deepclaude 
+
+quick: export DOUBLEWORD_API_KEY="your api key" && /home/rayu/deepclaude-customize/deepclaude.sh -b dw
 
 ```bash
 cd /home/rayu/deepclaude-customize
