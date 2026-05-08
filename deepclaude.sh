@@ -10,6 +10,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEEPSEEK_URL="https://api.deepseek.com/anthropic"
 OPENROUTER_URL="https://openrouter.ai/api"
 FIREWORKS_URL="https://api.fireworks.ai/inference"
+DOUBLEWORD_URL="https://api.doubleword.ai/v1"
+NVIDIA_URL="https://integrate.api.nvidia.com/v1"
 
 BACKEND="${CHEAPCLAUDE_DEFAULT_BACKEND:-ds}"
 ACTION="launch"
@@ -69,8 +71,22 @@ resolve_backend() {
             haiku="accounts/fireworks/models/deepseek-v4-pro"
             subagent="accounts/fireworks/models/deepseek-v4-pro"
             ;;
+        dw|doubleword)
+            key="${DOUBLEWORD_API_KEY:-}"
+            [[ -z "$key" ]] && { echo "ERROR: DOUBLEWORD_API_KEY not set" >&2; exit 1; }
+            url="$DOUBLEWORD_URL"
+            opus="moonshotai/Kimi-K2.6"; sonnet="moonshotai/Kimi-K2.6"
+            haiku="moonshotai/Kimi-K2.6"; subagent="moonshotai/Kimi-K2.6"
+            ;;
+        nv|nvidia)
+            key="${NVIDIA_API_KEY:-}"
+            [[ -z "$key" ]] && { echo "ERROR: NVIDIA_API_KEY not set" >&2; exit 1; }
+            url="$NVIDIA_URL"
+            opus="moonshotai/kimi-k2.6"; sonnet="moonshotai/kimi-k2.6"
+            haiku="moonshotai/kimi-k2.6"; subagent="moonshotai/kimi-k2.6"
+            ;;
         anthropic) ;;
-        *) echo "ERROR: Unknown backend '$BACKEND'. Use: ds, or, fw, anthropic" >&2; exit 1 ;;
+        *) echo "ERROR: Unknown backend '$BACKEND'. Use: ds, or, fw, dw, nv, anthropic" >&2; exit 1 ;;
     esac
     RESOLVED_URL="$url"; RESOLVED_KEY="$key"
     RESOLVED_OPUS="$opus"; RESOLVED_SONNET="$sonnet"
@@ -94,14 +110,18 @@ show_status() {
     echo "    DEEPSEEK_API_KEY:    $(mask_key "${DEEPSEEK_API_KEY:-}")"
     echo "    OPENROUTER_API_KEY:  $(mask_key "${OPENROUTER_API_KEY:-}")"
     echo "    FIREWORKS_API_KEY:   $(mask_key "${FIREWORKS_API_KEY:-}")"
+    echo "    DOUBLEWORD_API_KEY:  $(mask_key "${DOUBLEWORD_API_KEY:-}")"
+    echo "    NVIDIA_API_KEY:      $(mask_key "${NVIDIA_API_KEY:-}")"
     echo ""
     echo "  Backends:"
     echo "    deepclaude                  # DeepSeek V4 Pro (default)"
     echo "    deepclaude -b or            # OpenRouter (cheapest)"
     echo "    deepclaude -b fw            # Fireworks AI (fastest)"
+    echo "    deepclaude -b dw            # DoubleWord AI (Kimi K2.6)"
+    echo "    deepclaude -b nv            # NVIDIA (Kimi K2.6)"
     echo "    deepclaude -b anthropic     # Normal Claude Code"
     echo "    deepclaude --remote         # Remote control + DeepSeek"
-    echo "    deepclaude --remote -b or   # Remote control + OpenRouter"
+    echo "    deepclaude --remote -b dw   # Remote control + DoubleWord"
     echo ""
     local proxy_status
     proxy_status=$(curl -s http://127.0.0.1:3200/_proxy/status 2>/dev/null) || proxy_status=""

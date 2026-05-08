@@ -5,6 +5,8 @@ const BACKEND_DEFS = {
     deepseek: { url: 'https://api.deepseek.com/anthropic', keyEnv: 'DEEPSEEK_API_KEY' },
     openrouter: { url: 'https://openrouter.ai/api/v1', keyEnv: 'OPENROUTER_API_KEY' },
     fireworks: { url: 'https://api.fireworks.ai/inference/v1', keyEnv: 'FIREWORKS_API_KEY' },
+    doubleword: { url: 'https://api.doubleword.ai/v1', keyEnv: 'DOUBLEWORD_API_KEY' },
+    nvidia: { url: 'https://integrate.api.nvidia.com/v1', keyEnv: 'NVIDIA_API_KEY' },
 };
 
 // Legacy mode: start-proxy.js <targetUrl> <apiKey> (used by deepclaude.sh/ps1)
@@ -12,19 +14,10 @@ const targetUrl = process.argv[2] || process.env.CHEAPCLAUDE_TARGET_URL;
 const apiKey = process.argv[3] || process.env.CHEAPCLAUDE_API_KEY;
 
 if (targetUrl && apiKey) {
-    // Legacy single-backend mode
-    const backends = {};
-    for (const [name, def] of Object.entries(BACKEND_DEFS)) {
-        const key = process.env[def.keyEnv];
-        if (key) backends[name] = { url: def.url, apiKey: key };
-    }
-    const hasBackends = Object.keys(backends).length > 0;
-
+    // Legacy single-backend mode - don't pass backends to allow auto-detection
     const { port } = await startModelProxy({
         targetUrl,
         apiKey,
-        backends: hasBackends ? backends : undefined,
-        defaultMode: hasBackends ? undefined : undefined,
     });
     console.log(port);
 } else {
