@@ -14,9 +14,19 @@ const OPENAI_BACKENDS = ['doubleword', 'nvidia'];
 function anthropicToOpenAI(anthropicReq) {
     const messages = [];
     
-    // Handle system prompt
+    // Handle system prompt — can be string or array of content blocks
     if (anthropicReq.system) {
-        messages.push({ role: 'system', content: anthropicReq.system });
+        let systemText = anthropicReq.system;
+        if (Array.isArray(systemText)) {
+            // Strip cache_control and extract text
+            systemText = systemText
+                .filter(b => b.type === 'text')
+                .map(b => b.text)
+                .join('\n');
+        }
+        if (systemText) {
+            messages.push({ role: 'system', content: systemText });
+        }
     }
     
     // Convert messages
@@ -27,9 +37,14 @@ function anthropicToOpenAI(anthropicReq) {
             // Handle multi-part content
             const parts = [];
             let hasToolUse = false;
+            let hasToolResult = false;
             let toolCalls = [];
+            let toolResults = [];
             
             for (const block of msg.content) {
+                // Skip thinking blocks entirely — they are Anthropic-specific
+                if (block.type === 'thinking') continue;
+                
                 if (block.type === 'text') {
                     parts.push(block.text);
                 } else if (block.type === 'image') {
@@ -54,13 +69,27 @@ function anthropicToOpenAI(anthropicReq) {
                         }
                     });
                 } else if (block.type === 'tool_result') {
-                    // Anthropic user message with tool results - convert to tool role
-                    messages.push({
+                    // Anthropic user message with tool results
+                    hasToolResult = true;
+                    const resultContent = block.content;
+                    let contentStr;
+                    if (typeof resultContent === 'string') {
+                        contentStr = resultContent;
+                    } else if (Array.isArray(resultContent)) {
+                        contentStr = resultContent
+                            .filter(b => b.type === 'text')
+                            .map(b => b.text)
+                            .join('\n') || JSON.stringify(resultContent);
+                    } else {
+                        contentStr = JSON.stringify(resultContent || '');
+                    }
+                    toolResults.push({
                         role: 'tool',
                         tool_call_id: block.tool_use_id,
-                        content: typeof block.content === 'string' ? block.content : JSON.stringify(block.content)
+                        content: contentStr
                     });
                 }
+                // Skip any other unknown Anthropic block types silently
             }
             
             if (hasToolUse) {
@@ -70,6 +99,15 @@ function anthropicToOpenAI(anthropicReq) {
                     content: parts.length > 0 ? parts.join('\n') : null,
                     tool_calls: toolCalls
                 });
+            } else if (hasToolResult) {
+                // User message with tool results — push tool messages
+                // If there are also text parts, push user message first
+                if (parts.length > 0) {
+                    messages.push({ role: 'user', content: parts.join('\n') });
+                }
+                for (const tr of toolResults) {
+                    messages.push(tr);
+                }
             } else if (parts.length > 0) {
                 // Regular message with mixed content
                 const content = parts.every(p => typeof p === 'string') 
@@ -87,6 +125,11 @@ function anthropicToOpenAI(anthropicReq) {
         stream: anthropicReq.stream
     };
     
+    // Request streaming usage data for accurate token counting
+    if (anthropicReq.stream) {
+        openaiReq.stream_options = { include_usage: true };
+    }
+    
     // Optional parameters
     if (anthropicReq.temperature !== undefined) openaiReq.temperature = anthropicReq.temperature;
     if (anthropicReq.top_p !== undefined) openaiReq.top_p = anthropicReq.top_p;
@@ -95,7 +138,8 @@ function anthropicToOpenAI(anthropicReq) {
     if (anthropicReq.presence_penalty !== undefined) openaiReq.presence_penalty = anthropicReq.presence_penalty;
     if (anthropicReq.frequency_penalty !== undefined) openaiReq.frequency_penalty = anthropicReq.frequency_penalty;
     if (anthropicReq.user) openaiReq.user = anthropicReq.user;
-    if (anthropicReq.metadata) openaiReq.metadata = anthropicReq.metadata;
+    // Note: anthropicReq.thinking, anthropicReq.metadata, anthropicReq.cache_control
+    // are Anthropic-specific and intentionally NOT forwarded to OpenAI backends.
     
     // Tools
     if (anthropicReq.tools) {
@@ -103,8 +147,8 @@ function anthropicToOpenAI(anthropicReq) {
             type: 'function',
             function: {
                 name: t.name,
-                description: t.description,
-                parameters: t.input_schema
+                description: t.description || '',
+                parameters: t.input_schema || { type: 'object', properties: {} }
             }
         }));
         if (anthropicReq.tool_choice) {
@@ -117,6 +161,8 @@ function anthropicToOpenAI(anthropicReq) {
                     type: 'function',
                     function: { name: anthropicReq.tool_choice.name }
                 };
+            } else if (anthropicReq.tool_choice.type === 'none') {
+                openaiReq.tool_choice = 'none';
             }
         }
     }
@@ -135,11 +181,16 @@ function openaiToAnthropic(openaiResp) {
     const choice = openaiResp.choices?.[0];
     if (!choice) return null;
     
-    // Kimi puts response in reasoning field, not content
-    const text = choice.message?.content || choice.message?.reasoning || '';
     const content = [];
     
-    // Add text content if present
+    // Handle reasoning/thinking → emit as thinking block
+    const reasoning = choice.message?.reasoning || choice.message?.reasoning_content || '';
+    if (reasoning) {
+        content.push({ type: 'thinking', thinking: reasoning });
+    }
+    
+    // Handle text content → emit as text block
+    const text = choice.message?.content || '';
     if (text) {
         content.push({ type: 'text', text: text });
     }
@@ -147,14 +198,29 @@ function openaiToAnthropic(openaiResp) {
     // Handle tool calls
     if (choice.message?.tool_calls) {
         for (const toolCall of choice.message.tool_calls) {
+            let parsedArgs = {};
+            try {
+                parsedArgs = JSON.parse(toolCall.function.arguments || '{}');
+            } catch (e) {
+                // If arguments aren't valid JSON, wrap them
+                console.error(`[MODEL-PROXY] Failed to parse tool arguments for ${toolCall.function.name}:`, e.message);
+                parsedArgs = { _raw: toolCall.function.arguments };
+            }
             content.push({
                 type: 'tool_use',
-                id: toolCall.id,
+                id: toolCall.id || `toolu_${Date.now()}_${content.length}`,
                 name: toolCall.function.name,
-                input: JSON.parse(toolCall.function.arguments || '{}')
+                input: parsedArgs
             });
         }
+        console.log(`[MODEL-PROXY] Non-streaming response has ${choice.message.tool_calls.length} tool call(s): ${choice.message.tool_calls.map(t => t.function.name).join(', ')}`);
     }
+    
+    // Determine stop reason
+    const stopReason = choice.finish_reason === 'stop' ? 'end_turn' : 
+                     choice.finish_reason === 'tool_calls' ? 'tool_use' : 
+                     choice.finish_reason === 'length' ? 'max_tokens' :
+                     choice.finish_reason || 'end_turn';
     
     return {
         id: openaiResp.id || 'msg_' + Date.now(),
@@ -162,9 +228,7 @@ function openaiToAnthropic(openaiResp) {
         role: 'assistant',
         content: content.length > 0 ? content : [{ type: 'text', text: '' }],
         model: openaiResp.model,
-        stop_reason: choice.finish_reason === 'stop' ? 'end_turn' : 
-                     choice.finish_reason === 'tool_calls' ? 'tool_use' : 
-                     choice.finish_reason,
+        stop_reason: stopReason,
         usage: {
             input_tokens: openaiResp.usage?.prompt_tokens || 0,
             output_tokens: openaiResp.usage?.completion_tokens || 0
@@ -172,105 +236,9 @@ function openaiToAnthropic(openaiResp) {
     };
 }
 
-// Translate OpenAI streaming chunk to Anthropic SSE format
-function openaiChunkToAnthropic(chunk, isFirst) {
-    const events = [];
-    
-    if (isFirst) {
-        events.push('event: message_start');
-        events.push('data: ' + JSON.stringify({
-            type: 'message_start',
-            message: {
-                id: chunk.id || 'msg_' + Date.now(),
-                type: 'message',
-                role: 'assistant',
-                content: [],
-                model: chunk.model,
-                usage: { input_tokens: 0, output_tokens: 0 }
-            }
-        }));
-        events.push('');
-        events.push('event: content_block_start');
-        events.push('data: ' + JSON.stringify({
-            type: 'content_block_start',
-            index: 0,
-            content_block: { type: 'text', text: '' }
-        }));
-        events.push('');
-    }
-    
-    const delta = chunk.choices?.[0]?.delta;
-    if (delta) {
-        // Handle text content (including reasoning from Kimi)
-        const text = delta.content || delta.reasoning || '';
-        if (text) {
-            events.push('event: content_block_delta');
-            events.push('data: ' + JSON.stringify({
-                type: 'content_block_delta',
-                index: 0,
-                delta: { type: 'text_delta', text: text }
-            }));
-            events.push('');
-        }
-        
-        // Handle tool calls
-        if (delta.tool_calls) {
-            for (const toolCall of delta.tool_calls) {
-                if (toolCall.function?.name) {
-                    // Tool call start
-                    events.push('event: content_block_start');
-                    events.push('data: ' + JSON.stringify({
-                        type: 'content_block_start',
-                        index: 1,
-                        content_block: {
-                            type: 'tool_use',
-                            id: toolCall.id,
-                            name: toolCall.function.name,
-                            input: {}
-                        }
-                    }));
-                    events.push('');
-                }
-                if (toolCall.function?.arguments) {
-                    // Tool arguments delta
-                    events.push('event: content_block_delta');
-                    events.push('data: ' + JSON.stringify({
-                        type: 'content_block_delta',
-                        index: 1,
-                        delta: {
-                            type: 'input_json_delta',
-                            partial_json: toolCall.function.arguments
-                        }
-                    }));
-                    events.push('');
-                }
-            }
-        }
-    }
-    
-    const finishReason = chunk.choices?.[0]?.finish_reason;
-    if (finishReason) {
-        events.push('event: content_block_stop');
-        events.push('data: ' + JSON.stringify({ type: 'content_block_stop', index: 0 }));
-        events.push('');
-        events.push('event: message_delta');
-        events.push('data: ' + JSON.stringify({
-            type: 'message_delta',
-            delta: { 
-                stop_reason: finishReason === 'stop' ? 'end_turn' : 
-                            finishReason === 'tool_calls' ? 'tool_use' : 
-                            finishReason 
-            },
-            usage: { output_tokens: chunk.usage?.completion_tokens || 0 }
-        }));
-        events.push('');
-        events.push('event: message_stop');
-        events.push('data: ' + JSON.stringify({ type: 'message_stop' }));
-        events.push('');
-    }
-    
-    return events.length > 0 ? events.join('\n') + '\n' : null;
-}
+// NOTE: openaiChunkToAnthropic is no longer a standalone function.
+// All streaming translation is done inside OpenAIToAnthropicStream
+// which maintains state across chunks for proper content block lifecycle.
 
 const MODEL_REMAP = {
     deepseek: {
@@ -372,51 +340,257 @@ class UsageNormalizer extends Transform {
 }
 
 /**
- * Transform OpenAI SSE stream to Anthropic SSE format
+ * Stateful transform stream: OpenAI SSE → Anthropic SSE.
+ *
+ * Maintains state across chunks so that content blocks are properly
+ * opened and closed in the exact sequence Claude Code expects:
+ *   message_start → content_block_start(0, thinking) → thinking deltas*
+ *   → content_block_stop(0) → content_block_start(1, text) → text deltas*
+ *   → content_block_stop(1) → content_block_start(2, tool_use) →
+ *   tool deltas* → content_block_stop(2) → message_delta → message_stop
+ *
+ * Kimi K2.6 uses `reasoning` or `reasoning_content` for thinking,
+ * and `content` for the actual response text.
  */
 class OpenAIToAnthropicStream extends Transform {
     constructor(onUsage) {
         super();
         this._buf = '';
         this._onUsage = onUsage;
-        this._isFirst = true;
-        this._hasFinished = false;
+        this._isFirst = true;        // Need to emit message_start?
+        this._hasFinished = false;    // Already emitted message_stop?
         this._inputTokens = 0;
         this._outputTokens = 0;
+
+        // Content block state
+        this._thinkingBlockOpen = false;  // Is thinking block currently open?
+        this._thinkingBlockIndex = -1;    // Index of thinking block
+        this._textBlockOpen = false;      // Is text content_block currently open?
+        this._textBlockIndex = -1;        // Index of text block
+        this._nextBlockIndex = 0;         // Next content_block index to assign
+        // Map: OpenAI tool_call index → { anthropicIndex, id, name }
+        this._toolCallMap = new Map();
+        this._openBlockIndices = [];      // All block indices currently open (need stop)
+    }
+
+    _emitEvent(eventType, data) {
+        this.push(`event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`);
+    }
+
+    _ensureThinkingBlockOpen() {
+        if (!this._thinkingBlockOpen) {
+            this._thinkingBlockOpen = true;
+            this._thinkingBlockIndex = this._nextBlockIndex++;
+            this._openBlockIndices.push(this._thinkingBlockIndex);
+            this._emitEvent('content_block_start', {
+                type: 'content_block_start',
+                index: this._thinkingBlockIndex,
+                content_block: { type: 'thinking', thinking: '' }
+            });
+        }
+    }
+
+    _closeThinkingBlock() {
+        if (this._thinkingBlockOpen) {
+            this._thinkingBlockOpen = false;
+            this._emitEvent('content_block_stop', {
+                type: 'content_block_stop',
+                index: this._thinkingBlockIndex
+            });
+            this._openBlockIndices = this._openBlockIndices.filter(i => i !== this._thinkingBlockIndex);
+        }
+    }
+
+    _ensureTextBlockOpen() {
+        // Close thinking block first if it's still open
+        this._closeThinkingBlock();
+        
+        if (!this._textBlockOpen) {
+            this._textBlockOpen = true;
+            this._textBlockIndex = this._nextBlockIndex++;
+            this._openBlockIndices.push(this._textBlockIndex);
+            this._emitEvent('content_block_start', {
+                type: 'content_block_start',
+                index: this._textBlockIndex,
+                content_block: { type: 'text', text: '' }
+            });
+        }
+    }
+
+    _closeTextBlock() {
+        if (this._textBlockOpen) {
+            this._textBlockOpen = false;
+            this._emitEvent('content_block_stop', {
+                type: 'content_block_stop',
+                index: this._textBlockIndex
+            });
+            this._openBlockIndices = this._openBlockIndices.filter(i => i !== this._textBlockIndex);
+        }
+    }
+
+    _processChunk(openaiChunk) {
+        // Track usage from any chunk that has it
+        if (openaiChunk.usage) {
+            this._inputTokens = openaiChunk.usage.prompt_tokens || 0;
+            this._outputTokens = openaiChunk.usage.completion_tokens || 0;
+        }
+
+        // Skip duplicate finish events
+        const finishReason = openaiChunk.choices?.[0]?.finish_reason;
+        if (finishReason && this._hasFinished) return;
+
+        // 1. Emit message_start on first chunk
+        if (this._isFirst) {
+            this._isFirst = false;
+            this._emitEvent('message_start', {
+                type: 'message_start',
+                message: {
+                    id: openaiChunk.id || 'msg_' + Date.now(),
+                    type: 'message',
+                    role: 'assistant',
+                    content: [],
+                    model: openaiChunk.model,
+                    usage: { input_tokens: this._inputTokens, output_tokens: 0 }
+                }
+            });
+        }
+
+        const delta = openaiChunk.choices?.[0]?.delta;
+        if (delta) {
+            // 2. Handle reasoning/thinking content → emit as thinking block
+            const reasoning = delta.reasoning || delta.reasoning_content || '';
+            if (reasoning) {
+                this._ensureThinkingBlockOpen();
+                this._emitEvent('content_block_delta', {
+                    type: 'content_block_delta',
+                    index: this._thinkingBlockIndex,
+                    delta: { type: 'thinking_delta', thinking: reasoning }
+                });
+            }
+
+            // 3. Handle text content → emit as text block
+            const text = delta.content || '';
+            if (text) {
+                this._ensureTextBlockOpen();
+                this._emitEvent('content_block_delta', {
+                    type: 'content_block_delta',
+                    index: this._textBlockIndex,
+                    delta: { type: 'text_delta', text }
+                });
+            }
+
+            // 4. Handle tool calls
+            if (delta.tool_calls) {
+                // Close thinking and text blocks before starting tool blocks
+                this._closeThinkingBlock();
+                this._closeTextBlock();
+
+                for (const tc of delta.tool_calls) {
+                    const tcIndex = tc.index ?? 0;
+
+                    if (tc.function?.name) {
+                        // New tool call — assign an anthropic block index
+                        const anthropicIdx = this._nextBlockIndex++;
+                        const toolId = tc.id || `toolu_${Date.now()}_${tcIndex}`;
+                        this._toolCallMap.set(tcIndex, {
+                            anthropicIndex: anthropicIdx,
+                            id: toolId,
+                            name: tc.function.name
+                        });
+                        this._openBlockIndices.push(anthropicIdx);
+
+                        this._emitEvent('content_block_start', {
+                            type: 'content_block_start',
+                            index: anthropicIdx,
+                            content_block: {
+                                type: 'tool_use',
+                                id: toolId,
+                                name: tc.function.name,
+                                input: {}
+                            }
+                        });
+                    }
+
+                    if (tc.function?.arguments) {
+                        const mapping = this._toolCallMap.get(tcIndex);
+                        if (mapping) {
+                            this._emitEvent('content_block_delta', {
+                                type: 'content_block_delta',
+                                index: mapping.anthropicIndex,
+                                delta: {
+                                    type: 'input_json_delta',
+                                    partial_json: tc.function.arguments
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. Handle finish
+        if (finishReason) {
+            this._hasFinished = true;
+
+            // Close thinking block if still open
+            this._closeThinkingBlock();
+
+            // Close text block if still open
+            this._closeTextBlock();
+
+            // Close all remaining open tool blocks
+            for (const idx of [...this._openBlockIndices]) {
+                this._emitEvent('content_block_stop', {
+                    type: 'content_block_stop',
+                    index: idx
+                });
+            }
+            this._openBlockIndices = [];
+
+            // If no blocks were ever opened, we need at least an empty text block
+            if (this._nextBlockIndex === 0) {
+                this._emitEvent('content_block_start', {
+                    type: 'content_block_start',
+                    index: 0,
+                    content_block: { type: 'text', text: '' }
+                });
+                this._emitEvent('content_block_stop', {
+                    type: 'content_block_stop',
+                    index: 0
+                });
+            }
+
+            // Map finish reason
+            const stopReason = finishReason === 'stop' ? 'end_turn' :
+                               finishReason === 'tool_calls' ? 'tool_use' :
+                               finishReason === 'length' ? 'max_tokens' :
+                               finishReason || 'end_turn';
+
+            this._emitEvent('message_delta', {
+                type: 'message_delta',
+                delta: { stop_reason: stopReason },
+                usage: { output_tokens: openaiChunk.usage?.completion_tokens || this._outputTokens || 0 }
+            });
+
+            this._emitEvent('message_stop', { type: 'message_stop' });
+        }
     }
 
     _transform(chunk, _enc, cb) {
         this._buf += chunk.toString();
         const lines = this._buf.split('\n');
         this._buf = lines.pop() || '';
-        
+
         for (const line of lines) {
             const trimmed = line.trim();
             if (!trimmed || !trimmed.startsWith('data: ')) continue;
-            
+
             const data = trimmed.substring(6);
             if (data === '[DONE]') continue;
-            
+
             try {
                 const openaiChunk = JSON.parse(data);
-                if (openaiChunk.usage) {
-                    this._inputTokens = openaiChunk.usage.prompt_tokens || 0;
-                    this._outputTokens = openaiChunk.usage.completion_tokens || 0;
-                }
-                
-                // Only process finish events once
-                if (openaiChunk.choices?.[0]?.finish_reason && this._hasFinished) {
-                    continue;
-                }
-                
-                const anthropicEvents = openaiChunkToAnthropic(openaiChunk, this._isFirst);
-                if (anthropicEvents) {
-                    this.push(anthropicEvents);
-                    this._isFirst = false;
-                    if (openaiChunk.choices?.[0]?.finish_reason) {
-                        this._hasFinished = true;
-                    }
-                }
+                this._processChunk(openaiChunk);
             } catch (err) {
                 // Skip malformed chunks
             }
@@ -425,6 +599,19 @@ class OpenAIToAnthropicStream extends Transform {
     }
 
     _flush(cb) {
+        // Process any remaining buffered data
+        if (this._buf.trim()) {
+            const trimmed = this._buf.trim();
+            if (trimmed.startsWith('data: ')) {
+                const data = trimmed.substring(6);
+                if (data !== '[DONE]') {
+                    try {
+                        const openaiChunk = JSON.parse(data);
+                        this._processChunk(openaiChunk);
+                    } catch { /* skip */ }
+                }
+            }
+        }
         if (this._onUsage) this._onUsage(this._inputTokens, this._outputTokens);
         cb();
     }
@@ -648,6 +835,9 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             const headers = { ...clientReq.headers, host: dest.host };
             delete headers['content-length'];
 
+            // Determine if this is an OpenAI-format backend
+            const isOpenAIBackend = isModelCall && OPENAI_BACKENDS.includes(state.mode);
+
             if (isModelCall) {
                 delete headers['authorization'];
                 delete headers['x-api-key'];
@@ -655,6 +845,15 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     headers['authorization'] = `Bearer ${state.apiKey}`;
                 } else {
                     headers['x-api-key'] = state.apiKey;
+                }
+
+                // Strip Anthropic-specific headers for OpenAI backends
+                if (isOpenAIBackend) {
+                    delete headers['anthropic-version'];
+                    delete headers['anthropic-beta'];
+                    delete headers['anthropic-dangerous-direct-browser-access'];
+                    // Set proper content-type for OpenAI
+                    headers['content-type'] = 'application/json';
                 }
             }
 
@@ -682,25 +881,9 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     } catch { /* not JSON or parse error, pass through */ }
                 }
 
-                // Translate Anthropic format to OpenAI format if needed
-                if (useOpenAIFormat && isModelCall) {
-                    try {
-                        const anthropicReq = JSON.parse(body);
-                        let openaiReq = anthropicToOpenAI(anthropicReq);
-                        
-                        // Add NVIDIA-specific parameters
-                        if (state.mode === 'nvidia') {
-                            openaiReq = addNvidiaParams(openaiReq);
-                        }
-                        
-                        body = Buffer.from(JSON.stringify(openaiReq));
-                        console.log(`[MODEL-PROXY] #${reqId} translated Anthropic → OpenAI format`);
-                    } catch (err) {
-                        console.error(`[MODEL-PROXY] #${reqId} translation error:`, err.message);
-                    }
-                }
-
-                // Strip thinking blocks before forwarding.
+                // Strip thinking blocks before forwarding (must be done before
+                // OpenAI translation, since after translation the body is in
+                // OpenAI format where stripAllThinkingBlocks can't find them).
                 // Non-Anthropic: strip ALL blocks — backends reject thinking blocks
                 // they didn't generate, even unsigned ones.
                 // Anthropic after a non-Anthropic session: also strip ALL, because
@@ -717,12 +900,30 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         body = Buffer.from(JSON.stringify(parsed));
                     } catch { /* pass through */ }
                 }
-                if (isModelCall && !useOpenAIFormat) {
+                if (isModelCall && !isAnthropicMode) {
                     try {
                         const parsed = JSON.parse(body);
                         stripAllThinkingBlocks(parsed);
                         body = Buffer.from(JSON.stringify(parsed));
                     } catch { /* pass through */ }
+                }
+
+                // Translate Anthropic format to OpenAI format if needed
+                if (useOpenAIFormat && isModelCall) {
+                    try {
+                        const anthropicReq = JSON.parse(body);
+                        let openaiReq = anthropicToOpenAI(anthropicReq);
+                        
+                        // Add NVIDIA-specific parameters
+                        if (state.mode === 'nvidia') {
+                            openaiReq = addNvidiaParams(openaiReq);
+                        }
+                        
+                        body = Buffer.from(JSON.stringify(openaiReq));
+                        console.log(`[MODEL-PROXY] #${reqId} translated Anthropic → OpenAI format`);
+                    } catch (err) {
+                        console.error(`[MODEL-PROXY] #${reqId} translation error:`, err.message);
+                    }
                 }
 
                 // Change path to /chat/completions for OpenAI format

@@ -1,6 +1,6 @@
 # deepclaude
 
-Use Claude Code's autonomous agent loop with **DeepSeek V4 Pro**, **OpenRouter**, or any Anthropic-compatible backend. Same UX, 17x cheaper.
+Use Claude Code's autonomous agent loop with **DeepSeek V4 Pro**, **OpenRouter**, **DoubleWord AI**, **NVIDIA**, or any Anthropic-compatible backend. Same UX, 17x cheaper.
 
 ![Remote control running DeepSeek V4 Pro in the browser](screenshots/remote-control-deepseek.png)
 
@@ -61,6 +61,8 @@ deepclaude                  # Launch Claude Code with DeepSeek V4 Pro
 deepclaude --status         # Show available backends and keys
 deepclaude --backend or     # Use OpenRouter (cheapest, $0.44/M input)
 deepclaude --backend fw     # Use Fireworks AI (fastest, US servers)
+deepclaude --backend dw     # Use DoubleWord AI (Kimi K2.6)
+deepclaude --backend nv     # Use NVIDIA (Kimi K2.6)
 deepclaude --backend anthropic  # Normal Claude Code (when you need Opus)
 deepclaude --cost           # Show pricing comparison
 deepclaude --benchmark      # Latency test across all providers
@@ -89,6 +91,8 @@ Claude Code reads these environment variables to determine where to send API cal
 | **DeepSeek** (default) | `--backend ds` | $0.44 | $0.87 | China | Auto context caching (120x cheaper on repeat turns) |
 | **OpenRouter** | `--backend or` | $0.44 | $0.87 | US | Cheapest, lowest latency from US/EU |
 | **Fireworks AI** | `--backend fw` | $1.74 | $3.48 | US | Fastest inference |
+| **DoubleWord AI** | `--backend dw` | $0.44 | $0.87 | US | Kimi K2.6 via DoubleWord |
+| **NVIDIA** | `--backend nv` | $0.44 | $0.87 | US | Kimi K2.6 via NVIDIA NIM |
 | **Anthropic** | `--backend anthropic` | $3.00 | $15.00 | US | Original Claude Opus (for hard problems) |
 
 ### Setup per backend
@@ -109,6 +113,18 @@ export OPENROUTER_API_KEY="sk-or-..."    # macOS/Linux
 ```bash
 setx FIREWORKS_API_KEY "fw_..."          # Windows
 export FIREWORKS_API_KEY="fw_..."        # macOS/Linux
+```
+
+**DoubleWord AI** (optional):
+```bash
+setx DOUBLEWORD_API_KEY "..."            # Windows
+export DOUBLEWORD_API_KEY="..."          # macOS/Linux
+```
+
+**NVIDIA** (optional):
+```bash
+setx NVIDIA_API_KEY "nvapi-..."          # Windows
+export NVIDIA_API_KEY="nvapi-..."        # macOS/Linux
 ```
 
 ## Cost comparison
@@ -197,7 +213,21 @@ curl -sX POST http://127.0.0.1:3200/_proxy/mode -d "backend=openrouter"
 If successful, say: "Switched to OpenRouter."
 ```
 
-Then type `/deepseek`, `/anthropic`, or `/openrouter` in any Claude Code session to switch instantly.
+**`doubleword.md`:**
+```
+Switch the model proxy to DoubleWord. Run this command silently and report the result:
+curl -sX POST http://127.0.0.1:3200/_proxy/mode -d "backend=doubleword"
+If successful, say: "Switched to DoubleWord."
+```
+
+**`nvidia.md`:**
+```
+Switch the model proxy to NVIDIA. Run this command silently and report the result:
+curl -sX POST http://127.0.0.1:3200/_proxy/mode -d "backend=nvidia"
+If successful, say: "Switched to NVIDIA."
+```
+
+Then type `/deepseek`, `/anthropic`, `/openrouter`, `/doubleword`, or `/nvidia` in any Claude Code session to switch instantly.
 
 ### Option 2: CLI flag
 
@@ -221,6 +251,20 @@ Add to `.vscode/tasks.json`:
       "problemMatcher": []
     },
     {
+      "label": "Proxy: Switch to DoubleWord",
+      "type": "shell",
+      "command": "Invoke-RestMethod -Uri http://127.0.0.1:3200/_proxy/mode -Method Post -Body 'backend=doubleword'",
+      "presentation": { "reveal": "always" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Proxy: Switch to NVIDIA",
+      "type": "shell",
+      "command": "Invoke-RestMethod -Uri http://127.0.0.1:3200/_proxy/mode -Method Post -Body 'backend=nvidia'",
+      "presentation": { "reveal": "always" },
+      "problemMatcher": []
+    },
+    {
       "label": "Proxy: Switch to Anthropic",
       "type": "shell",
       "command": "Invoke-RestMethod -Uri http://127.0.0.1:3200/_proxy/mode -Method Post -Body 'backend=anthropic'",
@@ -234,6 +278,9 @@ Add to `.vscode/tasks.json`:
 Then bind in `keybindings.json`:
 ```json
 { "key": "ctrl+alt+d", "command": "workbench.action.tasks.runTask", "args": "Proxy: Switch to DeepSeek" },
+{ "key": "ctrl+alt+o", "command": "workbench.action.tasks.runTask", "args": "Proxy: Switch to OpenRouter" },
+{ "key": "ctrl+alt+w", "command": "workbench.action.tasks.runTask", "args": "Proxy: Switch to DoubleWord" },
+{ "key": "ctrl+alt+n", "command": "workbench.action.tasks.runTask", "args": "Proxy: Switch to NVIDIA" },
 { "key": "ctrl+alt+a", "command": "workbench.action.tasks.runTask", "args": "Proxy: Switch to Anthropic" }
 ```
 
@@ -292,11 +339,13 @@ Or on macOS/Linux:
 
 ## Remote control (`--remote`)
 
-Open a Claude Code session in any browser - with DeepSeek as the brain:
+Open a Claude Code session in any browser - with DeepSeek or other providers as the brain:
 
 ```bash
 deepclaude --remote                # Remote control + DeepSeek
 deepclaude --remote -b or          # Remote control + OpenRouter
+deepclaude --remote -b dw          # Remote control + DoubleWord
+deepclaude --remote -b nv          # Remote control + NVIDIA
 deepclaude --remote -b anthropic   # Remote control + Anthropic (normal)
 ```
 
