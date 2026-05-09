@@ -8,7 +8,7 @@ const MODEL_PATHS = ['/v1/messages'];
 const REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 min per request
 
 // OpenAI-only backends (use chat/completions instead of messages)
-const OPENAI_BACKENDS = ['doubleword', 'nvidia'];
+const OPENAI_BACKENDS = ['doubleword', 'nvidia', 'kimi'];
 
 // Translate Anthropic request to OpenAI format
 function anthropicToOpenAI(anthropicReq) {
@@ -240,7 +240,31 @@ function openaiToAnthropic(openaiResp) {
 // All streaming translation is done inside OpenAIToAnthropicStream
 // which maintains state across chunks for proper content block lifecycle.
 
-const MODEL_REMAP = {
+// Dynamic model from .env (set by deepclaude.sh via CHEAPCLAUDE_MODEL env)
+const ENV_MODEL = process.env.CHEAPCLAUDE_MODEL || null;
+
+// Build a remap entry that maps ALL Claude model names to a single target model
+function buildUniversalRemap(targetModel) {
+    return {
+        'claude-opus-4-6': targetModel,
+        'claude-opus-4-7': targetModel,
+        'claude-sonnet-4-6': targetModel,
+        'claude-sonnet-4-5-20250929': targetModel,
+        'claude-haiku-4-5-20251001': targetModel,
+    };
+}
+
+// Model remapping: Claude model names → backend model names
+// If CHEAPCLAUDE_MODEL is set, it overrides all hardcoded mappings
+const MODEL_REMAP = ENV_MODEL ? {
+    // Dynamic: all backends use the model from .env
+    deepseek:   buildUniversalRemap(ENV_MODEL),
+    openrouter: buildUniversalRemap(ENV_MODEL),
+    doubleword: buildUniversalRemap(ENV_MODEL),
+    nvidia:     buildUniversalRemap(ENV_MODEL),
+    kimi:       buildUniversalRemap(ENV_MODEL),
+} : {
+    // Fallback: hardcoded defaults (backward compatibility)
     deepseek: {
         'claude-opus-4-6':    'deepseek-v4-pro',
         'claude-opus-4-7':    'deepseek-v4-pro',
@@ -248,27 +272,10 @@ const MODEL_REMAP = {
         'claude-sonnet-4-5-20250929': 'deepseek-v4-flash',
         'claude-haiku-4-5-20251001':  'deepseek-v4-flash',
     },
-    openrouter: {
-        'claude-opus-4-6':    'deepseek/deepseek-v4-pro',
-        'claude-opus-4-7':    'deepseek/deepseek-v4-pro',
-        'claude-sonnet-4-6':  'deepseek/deepseek-v4-flash',
-        'claude-sonnet-4-5-20250929': 'deepseek/deepseek-v4-flash',
-        'claude-haiku-4-5-20251001':  'deepseek/deepseek-v4-flash',
-    },
-    doubleword: {
-        'claude-opus-4-6':    'moonshotai/Kimi-K2.6',
-        'claude-opus-4-7':    'moonshotai/Kimi-K2.6',
-        'claude-sonnet-4-6':  'moonshotai/Kimi-K2.6',
-        'claude-sonnet-4-5-20250929': 'moonshotai/Kimi-K2.6',
-        'claude-haiku-4-5-20251001':  'moonshotai/Kimi-K2.6',
-    },
-    nvidia: {
-        'claude-opus-4-6':    'moonshotai/kimi-k2.6',
-        'claude-opus-4-7':    'moonshotai/kimi-k2.6',
-        'claude-sonnet-4-6':  'moonshotai/kimi-k2.6',
-        'claude-sonnet-4-5-20250929': 'moonshotai/kimi-k2.6',
-        'claude-haiku-4-5-20251001':  'moonshotai/kimi-k2.6',
-    },
+    openrouter: buildUniversalRemap('deepseek/deepseek-v4-pro'),
+    doubleword: buildUniversalRemap('moonshotai/Kimi-K2.6'),
+    nvidia:     buildUniversalRemap('moonshotai/kimi-k2.6'),
+    kimi:       buildUniversalRemap('kimi-k2.6'),
 };
 
 const PRICING_PER_M = {
@@ -277,6 +284,7 @@ const PRICING_PER_M = {
     fireworks:  { input: 1.74,  output: 3.48 },
     doubleword: { input: 0.44,  output: 0.87 },
     nvidia:     { input: 0.44,  output: 0.87 },
+    kimi:       { input: 0.44,  output: 0.87 },
     anthropic:  { input: 3.00,  output: 15.00 },
     _single:    { input: 0.44,  output: 0.87 },
 };
@@ -652,12 +660,17 @@ function stripUnsignedThinkingBlocks(body) {
 export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends, defaultMode }) {
     return new Promise((resolve, reject) => {
         const initialTarget = new URL(targetUrl);
-        const initialBearer = targetUrl.includes('openrouter') || targetUrl.includes('fireworks') || targetUrl.includes('doubleword.ai') || targetUrl.includes('nvidia.com');
+        const initialBearer = targetUrl.includes('openrouter') || targetUrl.includes('fireworks') || targetUrl.includes('doubleword.ai') || targetUrl.includes('nvidia.com') || targetUrl.includes('moonshot.ai');
+
+        if (ENV_MODEL) {
+            console.log(`[MODEL-PROXY] Using model from .env: ${ENV_MODEL}`);
+        }
 
         // Auto-detect backend type from URL
         let detectedMode = '_single';
         if (targetUrl.includes('doubleword.ai')) detectedMode = 'doubleword';
         else if (targetUrl.includes('nvidia.com')) detectedMode = 'nvidia';
+        else if (targetUrl.includes('moonshot.ai')) detectedMode = 'kimi';
         else if (targetUrl.includes('openrouter')) detectedMode = 'openrouter';
         else if (targetUrl.includes('fireworks')) detectedMode = 'fireworks';
         else if (targetUrl.includes('deepseek')) detectedMode = 'deepseek';
@@ -668,7 +681,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 allBackends[name] = {
                     target: new URL(cfg.url),
                     apiKey: cfg.apiKey,
-                    useBearer: cfg.url.includes('openrouter') || cfg.url.includes('fireworks') || cfg.url.includes('doubleword.ai') || cfg.url.includes('nvidia.com'),
+                    useBearer: cfg.url.includes('openrouter') || cfg.url.includes('fireworks') || cfg.url.includes('doubleword.ai') || cfg.url.includes('nvidia.com') || cfg.url.includes('moonshot.ai'),
                 };
             }
         }

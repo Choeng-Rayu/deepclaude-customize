@@ -5,11 +5,17 @@
 ### 1. Set Your API Key
 
 ```bash
-# For DoubleWord AI (Kimi K2.6)
+# For DoubleWord AI (DeepSeek V4 Pro)
 export DOUBLEWORD_API_KEY="your api key"
 
 # For NVIDIA (Kimi K2.6)
 export NVIDIA_API_KEY="your-nvidia-key-here"
+
+# For Kimi / Moonshot AI Direct (Kimi K2.6)
+export KIMI_API_KEY="your-kimi-key-here"
+
+# For DeepSeek (DeepSeek V4 Pro, native Anthropic format)
+export DEEPSEEK_API_KEY="your-deepseek-key-here"
 
 # Make it permanent (add to ~/.bashrc)
 echo 'export DOUBLEWORD_API_KEY="your api key"' >> ~/.bashrc
@@ -23,13 +29,16 @@ quick: export DOUBLEWORD_API_KEY="your api key" && /home/rayu/deepclaude-customi
 ```bash
 cd /home/rayu/deepclaude-customize
 
-# Use DoubleWord AI (Kimi K2.6)
+# Use DoubleWord AI (DeepSeek V4 Pro)
 ./deepclaude.sh -b dw
 
 # Use NVIDIA (Kimi K2.6)
 ./deepclaude.sh -b nv
 
-# Use DeepSeek V4 Pro (original)
+# Use Kimi / Moonshot AI (Kimi K2.6)
+./deepclaude.sh -b kimi
+
+# Use DeepSeek V4 Pro (native Anthropic format)
 ./deepclaude.sh -b ds
 
 # Use OpenRouter

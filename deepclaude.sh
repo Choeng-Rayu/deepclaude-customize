@@ -1,24 +1,46 @@
 #!/usr/bin/env bash
-# deepclaude — Use Claude Code with DeepSeek V4 Pro or other cheap backends
-# Usage: deepclaude [--backend ds|or|fw|anthropic] [--remote] [--status] [--cost] [--benchmark]
+# deepclaude — Use Claude Code with any LLM backend
+# Configuration: proxy/.env (provider, keys, models)
+# Usage: deepclaude [--backend <provider>] [--remote] [--status] [--cost] [--help]
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/proxy/.env"
 
-# --- Config ---
-DEEPSEEK_URL="https://api.deepseek.com/anthropic"
-OPENROUTER_URL="https://openrouter.ai/api"
-FIREWORKS_URL="https://api.fireworks.ai/inference"
-DOUBLEWORD_URL="https://api.doubleword.ai/v1"
-NVIDIA_URL="https://integrate.api.nvidia.com/v1"
+# --- Load .env ---
+if [[ -f "$ENV_FILE" ]]; then
+    # Source .env, skipping comments and empty lines
+    set -a
+    while IFS='=' read -r key value; do
+        # Skip comments and empty lines
+        [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+        # Trim whitespace and inline comments
+        key=$(echo "$key" | xargs)
+        value=$(echo "$value" | sed 's/#.*//' | xargs)
+        [[ -n "$key" && -n "$value" ]] && export "$key=$value"
+    done < "$ENV_FILE"
+    set +a
+fi
 
-BACKEND="${CHEAPCLAUDE_DEFAULT_BACKEND:-ds}"
+# --- Provider URL Map ---
+declare -A PROVIDER_URLS=(
+    [doubleword]="https://api.doubleword.ai/v1"
+    [nvidia]="https://integrate.api.nvidia.com/v1"
+    [kimi]="https://api.moonshot.ai/v1"
+    [deepseek]="https://api.deepseek.com/anthropic"
+)
+
+# --- Default backend from .env or fallback ---
+BACKEND="${API_PROVIDER:-deepseek}"
+# Normalize to lowercase
+BACKEND=$(echo "$BACKEND" | tr '[:upper:]' '[:lower:]')
+
 ACTION="launch"
 SWITCH_BACKEND=""
 PROXY_PID=""
 
-# --- Parse args ---
+# --- Parse args (override .env if provided) ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --backend|-b) BACKEND="$2"; shift 2 ;;
@@ -26,11 +48,17 @@ while [[ $# -gt 0 ]]; do
         --remote|-r)  ACTION="remote"; shift ;;
         --status)     ACTION="status"; shift ;;
         --cost)       ACTION="cost"; shift ;;
-        --benchmark)  ACTION="benchmark"; shift ;;
         --help|-h)    ACTION="help"; shift ;;
         *)            break ;;
     esac
 done
+
+# Normalize backend aliases
+case "$BACKEND" in
+    dw) BACKEND="doubleword" ;;
+    nv) BACKEND="nvidia" ;;
+    ds) BACKEND="deepseek" ;;
+esac
 
 cleanup_proxy() {
     if [[ -n "$PROXY_PID" ]] && kill -0 "$PROXY_PID" 2>/dev/null; then
@@ -46,82 +74,77 @@ mask_key() {
 }
 
 resolve_backend() {
-    local url="" key="" opus="" sonnet="" haiku="" subagent=""
+    local url="" key="" model=""
+
     case "$BACKEND" in
-        ds|deepseek)
-            key="${DEEPSEEK_API_KEY:-}"
-            [[ -z "$key" ]] && { echo "ERROR: DEEPSEEK_API_KEY not set" >&2; exit 1; }
-            url="$DEEPSEEK_URL"
-            opus="deepseek-v4-pro"; sonnet="deepseek-v4-pro"
-            haiku="deepseek-v4-flash"; subagent="deepseek-v4-flash"
-            ;;
-        or|openrouter)
-            key="${OPENROUTER_API_KEY:-}"
-            [[ -z "$key" ]] && { echo "ERROR: OPENROUTER_API_KEY not set" >&2; exit 1; }
-            url="$OPENROUTER_URL"
-            opus="deepseek/deepseek-v4-pro"; sonnet="deepseek/deepseek-v4-pro"
-            haiku="deepseek/deepseek-v4-pro"; subagent="deepseek/deepseek-v4-pro"
-            ;;
-        fw|fireworks)
-            key="${FIREWORKS_API_KEY:-}"
-            [[ -z "$key" ]] && { echo "ERROR: FIREWORKS_API_KEY not set" >&2; exit 1; }
-            url="$FIREWORKS_URL"
-            opus="accounts/fireworks/models/deepseek-v4-pro"
-            sonnet="accounts/fireworks/models/deepseek-v4-pro"
-            haiku="accounts/fireworks/models/deepseek-v4-pro"
-            subagent="accounts/fireworks/models/deepseek-v4-pro"
-            ;;
-        dw|doubleword)
+        doubleword)
             key="${DOUBLEWORD_API_KEY:-}"
-            [[ -z "$key" ]] && { echo "ERROR: DOUBLEWORD_API_KEY not set" >&2; exit 1; }
-            url="$DOUBLEWORD_URL"
-            opus="moonshotai/Kimi-K2.6"; sonnet="moonshotai/Kimi-K2.6"
-            haiku="moonshotai/Kimi-K2.6"; subagent="moonshotai/Kimi-K2.6"
+            url="${PROVIDER_URLS[doubleword]}"
+            model="${DOUBLEWORD_MODEL:-deepseek-ai/DeepSeek-V4-Pro}"
             ;;
-        nv|nvidia)
+        nvidia)
             key="${NVIDIA_API_KEY:-}"
-            [[ -z "$key" ]] && { echo "ERROR: NVIDIA_API_KEY not set" >&2; exit 1; }
-            url="$NVIDIA_URL"
-            opus="moonshotai/kimi-k2.6"; sonnet="moonshotai/kimi-k2.6"
-            haiku="moonshotai/kimi-k2.6"; subagent="moonshotai/kimi-k2.6"
+            url="${PROVIDER_URLS[nvidia]}"
+            model="${NVIDIA_MODEL:-moonshotai/Kimi-K2.6}"
             ;;
-        anthropic) ;;
-        *) echo "ERROR: Unknown backend '$BACKEND'. Use: ds, or, fw, dw, nv, anthropic" >&2; exit 1 ;;
+        kimi)
+            key="${KIMI_API_KEY:-}"
+            url="${PROVIDER_URLS[kimi]}"
+            model="${KIMI_MODEL:-kimi-k2.6}"
+            ;;
+        deepseek)
+            key="${DEEPSEEK_API_KEY:-}"
+            url="${PROVIDER_URLS[deepseek]}"
+            model="${DEEPSEEK_MODEL:-deepseek-v4-pro}"
+            ;;
+        anthropic)
+            # Native Claude Code — no proxy needed
+            return 0
+            ;;
+        *)
+            echo "ERROR: Unknown provider '$BACKEND'" >&2
+            echo "  Supported: doubleword, nvidia, kimi, deepseek, anthropic" >&2
+            echo "  Set API_PROVIDER in proxy/.env or use -b flag" >&2
+            exit 1
+            ;;
     esac
-    RESOLVED_URL="$url"; RESOLVED_KEY="$key"
-    RESOLVED_OPUS="$opus"; RESOLVED_SONNET="$sonnet"
-    RESOLVED_HAIKU="$haiku"; RESOLVED_SUBAGENT="$subagent"
+
+    [[ -z "$key" ]] && { echo "ERROR: ${BACKEND^^}_API_KEY not set in proxy/.env" >&2; exit 1; }
+
+    RESOLVED_URL="$url"
+    RESOLVED_KEY="$key"
+    RESOLVED_MODEL="$model"
 }
 
 set_model_env() {
-    export ANTHROPIC_DEFAULT_OPUS_MODEL="$RESOLVED_OPUS"
-    export ANTHROPIC_DEFAULT_SONNET_MODEL="$RESOLVED_SONNET"
-    export ANTHROPIC_DEFAULT_HAIKU_MODEL="$RESOLVED_HAIKU"
-    export CLAUDE_CODE_SUBAGENT_MODEL="$RESOLVED_SUBAGENT"
+    # Use the model from .env for all Claude Code model slots
+    export ANTHROPIC_DEFAULT_OPUS_MODEL="$RESOLVED_MODEL"
+    export ANTHROPIC_DEFAULT_SONNET_MODEL="$RESOLVED_MODEL"
+    export ANTHROPIC_DEFAULT_HAIKU_MODEL="$RESOLVED_MODEL"
+    export CLAUDE_CODE_SUBAGENT_MODEL="$RESOLVED_MODEL"
     export CLAUDE_CODE_EFFORT_LEVEL="max"
+    # Pass model to proxy for dynamic remapping
+    export CHEAPCLAUDE_MODEL="$RESOLVED_MODEL"
 }
 
 show_status() {
     echo ""
-    echo "  deepclaude — Backend Status"
-    echo "  ============================"
+    echo "  deepclaude — Configuration"
+    echo "  ═══════════════════════════"
     echo ""
-    echo "  Keys:"
-    echo "    DEEPSEEK_API_KEY:    $(mask_key "${DEEPSEEK_API_KEY:-}")"
-    echo "    OPENROUTER_API_KEY:  $(mask_key "${OPENROUTER_API_KEY:-}")"
-    echo "    FIREWORKS_API_KEY:   $(mask_key "${FIREWORKS_API_KEY:-}")"
-    echo "    DOUBLEWORD_API_KEY:  $(mask_key "${DOUBLEWORD_API_KEY:-}")"
-    echo "    NVIDIA_API_KEY:      $(mask_key "${NVIDIA_API_KEY:-}")"
+    echo "  .env file: $ENV_FILE"
+    echo "  Active provider: ${API_PROVIDER:-not set}"
     echo ""
-    echo "  Backends:"
-    echo "    deepclaude                  # DeepSeek V4 Pro (default)"
-    echo "    deepclaude -b or            # OpenRouter (cheapest)"
-    echo "    deepclaude -b fw            # Fireworks AI (fastest)"
-    echo "    deepclaude -b dw            # DoubleWord AI (Kimi K2.6)"
-    echo "    deepclaude -b nv            # NVIDIA (Kimi K2.6)"
-    echo "    deepclaude -b anthropic     # Normal Claude Code"
-    echo "    deepclaude --remote         # Remote control + DeepSeek"
-    echo "    deepclaude --remote -b dw   # Remote control + DoubleWord"
+    echo "  Providers:"
+    echo "    doubleword  Key: $(mask_key "${DOUBLEWORD_API_KEY:-}")  Model: ${DOUBLEWORD_MODEL:-not set}"
+    echo "    nvidia      Key: $(mask_key "${NVIDIA_API_KEY:-}")  Model: ${NVIDIA_MODEL:-not set}"
+    echo "    kimi        Key: $(mask_key "${KIMI_API_KEY:-}")  Model: ${KIMI_MODEL:-not set}"
+    echo "    deepseek    Key: $(mask_key "${DEEPSEEK_API_KEY:-}")  Model: ${DEEPSEEK_MODEL:-not set}"
+    echo ""
+    echo "  Usage:"
+    echo "    ./deepclaude.sh              # Uses API_PROVIDER from .env"
+    echo "    ./deepclaude.sh -b nvidia    # Override with NVIDIA"
+    echo "    ./deepclaude.sh -b anthropic # Use native Claude"
     echo ""
     local proxy_status
     proxy_status=$(curl -s http://127.0.0.1:3200/_proxy/status 2>/dev/null) || proxy_status=""
@@ -136,88 +159,65 @@ show_status() {
 
 show_cost() {
     echo ""
-    echo "  DeepSeek V4 Pro Pricing"
-    echo "  ======================="
+    echo "  Provider Pricing (per 1M tokens)"
+    echo "  ════════════════════════════════"
     echo ""
-    echo "  Provider        Input/M    Output/M   Cache Hit/M"
-    echo "  ----------      --------   --------   -----------"
-    echo "  DeepSeek        \$0.44      \$0.87      \$0.004"
-    echo "  OpenRouter      \$0.44      \$0.87      (provider)"
-    echo "  Fireworks       \$1.74      \$3.48      (provider)"
-    echo "  Anthropic       \$3.00      \$15.00     \$0.30"
-    echo ""
-    echo "  Monthly estimate (heavy use, 25 days): \$30-80"
+    echo "  Provider        Input      Output"
+    echo "  ──────────      ────────   ────────"
+    echo "  DoubleWord      \$0.44      \$0.87"
+    echo "  NVIDIA          \$0.44      \$0.87"
+    echo "  Kimi            \$0.44      \$0.87"
+    echo "  DeepSeek        \$0.44      \$0.87"
+    echo "  Anthropic       \$3.00      \$15.00"
     echo ""
 }
 
 show_help() {
-    echo "deepclaude — Claude Code with cheap backends"
+    echo "deepclaude — Claude Code with any LLM backend"
     echo ""
     echo "Usage: deepclaude [options] [-- claude-args...]"
     echo ""
-    echo "Options:"
-    echo "  -b, --backend <ds|or|fw|anthropic>  Backend (default: ds)"
-    echo "  -r, --remote                        Remote control mode (browser URL)"
-    echo "  --status                             Show keys and backends"
-    echo "  --cost                               Pricing comparison"
-    echo "  --benchmark                          Latency test"
-    echo "  -s, --switch <backend>               Switch proxy mid-session"
-    echo "  -h, --help                           This help"
+    echo "By default, reads provider/model from proxy/.env"
     echo ""
-    echo "Environment variables:"
-    echo "  DEEPSEEK_API_KEY      DeepSeek API key (required for ds)"
-    echo "  OPENROUTER_API_KEY    OpenRouter API key (required for or)"
-    echo "  FIREWORKS_API_KEY     Fireworks API key (required for fw)"
-    echo "  CHEAPCLAUDE_DEFAULT_BACKEND  Default backend (default: ds)"
+    echo "Options:"
+    echo "  -b, --backend <provider>  Override provider (doubleword|nvidia|kimi|deepseek|anthropic)"
+    echo "  -r, --remote              Remote control mode"
+    echo "  --status                  Show configuration and provider keys"
+    echo "  --cost                    Pricing comparison"
+    echo "  -s, --switch <provider>   Switch proxy mid-session"
+    echo "  -h, --help                This help"
+    echo ""
+    echo "Configuration: proxy/.env"
+    echo "  API_PROVIDER=doubleword   # Active provider"
+    echo "  DOUBLEWORD_API_KEY=...    # Provider API key"
+    echo "  DOUBLEWORD_MODEL=...      # Model to use"
+    echo ""
+    echo "Supported providers:"
+    echo "  doubleword  https://api.doubleword.ai      (OpenAI-compatible)"
+    echo "  nvidia      https://integrate.api.nvidia.com (OpenAI-compatible)"
+    echo "  kimi        https://api.moonshot.ai         (OpenAI-compatible)"
+    echo "  deepseek    https://api.deepseek.com        (Anthropic-native)"
+    echo "  anthropic   (native Claude Code, no proxy)"
 }
 
 do_switch() {
     local backend="$SWITCH_BACKEND"
+    # Normalize
     case "$backend" in
-        ds|deepseek)   backend="deepseek" ;;
-        or|openrouter) backend="openrouter" ;;
-        fw|fireworks)  backend="fireworks" ;;
-        anthropic)     backend="anthropic" ;;
-        *) echo "ERROR: Unknown backend '$backend'. Use: ds, or, fw, anthropic" >&2; exit 1 ;;
+        dw) backend="doubleword" ;;
+        nv) backend="nvidia" ;;
+        ds) backend="deepseek" ;;
     esac
     local resp
     resp=$(curl -sX POST http://127.0.0.1:3200/_proxy/mode -d "backend=$backend" 2>/dev/null) || {
-        echo "  Proxy not running. Start with: deepclaude" >&2; exit 1
+        echo "  Proxy not running. Start with: ./deepclaude.sh" >&2; exit 1
     }
     echo "  $resp"
 }
 
-run_benchmark() {
-    echo ""
-    echo "  Latency Benchmark (1 request each)"
-    echo "  ==================================="
-    for name in deepseek openrouter fireworks; do
-        local url="" key="" model=""
-        case "$name" in
-            deepseek)   url="$DEEPSEEK_URL"; key="${DEEPSEEK_API_KEY:-}"; model="deepseek-v4-pro" ;;
-            openrouter) url="$OPENROUTER_URL"; key="${OPENROUTER_API_KEY:-}"; model="deepseek/deepseek-v4-pro" ;;
-            fireworks)  url="$FIREWORKS_URL"; key="${FIREWORKS_API_KEY:-}"; model="accounts/fireworks/models/deepseek-v4-pro" ;;
-        esac
-        if [[ -z "$key" ]]; then echo "  $name: SKIP (no key)"; continue; fi
-        local start_ms=$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')
-        local status=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$url/v1/messages" \
-            -H "x-api-key: $key" -H "content-type: application/json" -H "anthropic-version: 2023-06-01" \
-            -d "{\"model\":\"$model\",\"max_tokens\":32,\"messages\":[{\"role\":\"user\",\"content\":\"Reply: ok\"}]}" \
-            --max-time 30 2>/dev/null || echo "timeout")
-        local end_ms=$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')
-        local elapsed=$((end_ms - start_ms))
-        if [[ "$status" == "200" ]]; then
-            echo "  $name: OK (${elapsed}ms)"
-        else
-            echo "  $name: FAIL ($status, ${elapsed}ms)"
-        fi
-    done
-    echo ""
-}
-
 launch_claude() {
     if [[ "$BACKEND" == "anthropic" ]]; then
-        echo "  Launching Claude Code (normal Anthropic backend)..."
+        echo "  Launching Claude Code (native Anthropic)..."
         unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN
         unset ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
         unset ANTHROPIC_DEFAULT_HAIKU_MODEL CLAUDE_CODE_SUBAGENT_MODEL
@@ -227,18 +227,26 @@ launch_claude() {
 
     resolve_backend
 
-    echo "  Starting model proxy for $BACKEND..."
+    echo ""
+    echo "  ╔══════════════════════════════════════════╗"
+    echo "  ║         deepclaude — Starting            ║"
+    echo "  ╠══════════════════════════════════════════╣"
+    echo "  ║  Provider: $(printf '%-29s' "$BACKEND")║"
+    echo "  ║  Model:    $(printf '%-29s' "$RESOLVED_MODEL")║"
+    echo "  ║  URL:      $(printf '%-29s' "$RESOLVED_URL")║"
+    echo "  ╚══════════════════════════════════════════╝"
+    echo ""
 
     local port_file
     port_file=$(mktemp)
-    node "$SCRIPT_DIR/proxy/start-proxy.js" "$RESOLVED_URL" "$RESOLVED_KEY" > "$port_file" 2>&1 &
+    CHEAPCLAUDE_MODEL="$RESOLVED_MODEL" \
+        node "$SCRIPT_DIR/proxy/start-proxy.js" "$RESOLVED_URL" "$RESOLVED_KEY" > "$port_file" 2>&1 &
     PROXY_PID=$!
 
     local tries=0
     while [[ $tries -lt 30 ]]; do
         if [[ -s "$port_file" ]]; then
             local last_line=$(tail -1 "$port_file")
-            # Check if last line is a number (the port)
             if [[ "$last_line" =~ ^[0-9]+$ ]]; then
                 break
             fi
@@ -249,6 +257,7 @@ launch_claude() {
 
     if [[ ! -s "$port_file" ]]; then
         echo "ERROR: Proxy failed to start" >&2
+        cat "$port_file" >&2
         rm -f "$port_file"
         exit 1
     fi
@@ -257,9 +266,8 @@ launch_claude() {
     proxy_port=$(tail -1 "$port_file" | sed 's/\x1b\[[0-9;]*m//g')
     rm -f "$port_file"
 
-    echo "  Proxy on :$proxy_port -> $RESOLVED_URL"
-    echo "  Launching Claude Code via $BACKEND..."
-    echo "  Model: $RESOLVED_OPUS (main) + $RESOLVED_HAIKU (subagents)"
+    echo "  Proxy on :$proxy_port → $RESOLVED_URL"
+    echo "  Launching Claude Code..."
     echo ""
 
     export ANTHROPIC_BASE_URL="http://127.0.0.1:$proxy_port"
@@ -271,7 +279,7 @@ launch_claude() {
 
 launch_remote() {
     if [[ "$BACKEND" == "anthropic" ]]; then
-        echo "  Launching remote control (Anthropic)..."
+        echo "  Launching remote control (native Anthropic)..."
         unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN
         unset ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
         unset ANTHROPIC_DEFAULT_HAIKU_MODEL CLAUDE_CODE_SUBAGENT_MODEL
@@ -281,11 +289,12 @@ launch_remote() {
 
     resolve_backend
 
-    echo "  Starting model proxy for $BACKEND..."
+    echo "  Starting proxy for $BACKEND ($RESOLVED_MODEL)..."
 
     local port_file
     port_file=$(mktemp)
-    node "$SCRIPT_DIR/proxy/start-proxy.js" "$RESOLVED_URL" "$RESOLVED_KEY" > "$port_file" &
+    CHEAPCLAUDE_MODEL="$RESOLVED_MODEL" \
+        node "$SCRIPT_DIR/proxy/start-proxy.js" "$RESOLVED_URL" "$RESOLVED_KEY" > "$port_file" &
     PROXY_PID=$!
 
     local tries=0
@@ -304,8 +313,8 @@ launch_remote() {
     proxy_port=$(head -1 "$port_file")
     rm -f "$port_file"
 
-    echo "  Proxy on :$proxy_port -> $RESOLVED_URL"
-    echo "  Launching remote control via $BACKEND..."
+    echo "  Proxy on :$proxy_port → $RESOLVED_URL"
+    echo "  Launching remote control..."
     echo ""
 
     export ANTHROPIC_BASE_URL="http://127.0.0.1:$proxy_port"
@@ -319,7 +328,6 @@ launch_remote() {
 case "$ACTION" in
     status)    show_status ;;
     cost)      show_cost ;;
-    benchmark) run_benchmark ;;
     help)      show_help ;;
     switch)    do_switch ;;
     remote)    launch_remote "$@" ;;
