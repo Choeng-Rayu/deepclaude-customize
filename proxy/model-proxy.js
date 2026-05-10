@@ -8,7 +8,8 @@ const MODEL_PATHS = ['/v1/messages'];
 const REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 min per request
 
 // OpenAI-only backends (use chat/completions instead of messages)
-const OPENAI_BACKENDS = ['doubleword', 'nvidia', 'kimi'];
+// Note: 'kimi' (api.kimi.com/coding/) is NOT here — it uses Anthropic protocol natively
+const OPENAI_BACKENDS = ['doubleword', 'nvidia', 'moonshot'];
 
 // Translate Anthropic request to OpenAI format
 function anthropicToOpenAI(anthropicReq) {
@@ -48,13 +49,20 @@ function anthropicToOpenAI(anthropicReq) {
                 if (block.type === 'text') {
                     parts.push(block.text);
                 } else if (block.type === 'image') {
-                    // Convert Anthropic image format to OpenAI format
+                    // Convert Anthropic image format to OpenAI/Kimi image_url format
+                    // Kimi K2.6 supports: data:{media_type};base64,{data}
                     if (block.source?.type === 'base64') {
                         parts.push({
                             type: 'image_url',
                             image_url: {
                                 url: `data:${block.source.media_type};base64,${block.source.data}`
                             }
+                        });
+                    } else if (block.source?.type === 'url') {
+                        // URL-based images
+                        parts.push({
+                            type: 'image_url',
+                            image_url: { url: block.source.url }
                         });
                     }
                 } else if (block.type === 'tool_use') {
@@ -76,10 +84,30 @@ function anthropicToOpenAI(anthropicReq) {
                     if (typeof resultContent === 'string') {
                         contentStr = resultContent;
                     } else if (Array.isArray(resultContent)) {
-                        contentStr = resultContent
-                            .filter(b => b.type === 'text')
-                            .map(b => b.text)
-                            .join('\n') || JSON.stringify(resultContent);
+                        // Tool results can contain images too (e.g., screenshot results)
+                        const hasImages = resultContent.some(b => b.type === 'image');
+                        if (hasImages) {
+                            // Preserve multimodal tool results as array
+                            const multiParts = [];
+                            for (const b of resultContent) {
+                                if (b.type === 'text') {
+                                    multiParts.push({ type: 'text', text: b.text });
+                                } else if (b.type === 'image' && b.source?.type === 'base64') {
+                                    multiParts.push({
+                                        type: 'image_url',
+                                        image_url: {
+                                            url: `data:${b.source.media_type};base64,${b.source.data}`
+                                        }
+                                    });
+                                }
+                            }
+                            contentStr = multiParts;
+                        } else {
+                            contentStr = resultContent
+                                .filter(b => b.type === 'text')
+                                .map(b => b.text)
+                                .join('\n') || JSON.stringify(resultContent);
+                        }
                     } else {
                         contentStr = JSON.stringify(resultContent || '');
                     }
@@ -92,28 +120,37 @@ function anthropicToOpenAI(anthropicReq) {
                 // Skip any other unknown Anthropic block types silently
             }
             
+            // Helper: build content value — if parts has any objects (images),
+            // wrap all strings as {type:'text', text:...} to create a proper
+            // OpenAI multimodal content array
+            const hasObjects = parts.some(p => typeof p !== 'string');
+            const buildContent = () => {
+                if (!hasObjects) return parts.join('\n');
+                // Convert to OpenAI multimodal content array
+                return parts.map(p => 
+                    typeof p === 'string' ? { type: 'text', text: p } : p
+                );
+            };
+
             if (hasToolUse) {
                 // Assistant message with tool calls
                 messages.push({
                     role: 'assistant',
-                    content: parts.length > 0 ? parts.join('\n') : null,
+                    content: parts.length > 0 ? buildContent() : null,
                     tool_calls: toolCalls
                 });
             } else if (hasToolResult) {
                 // User message with tool results — push tool messages
                 // If there are also text parts, push user message first
                 if (parts.length > 0) {
-                    messages.push({ role: 'user', content: parts.join('\n') });
+                    messages.push({ role: 'user', content: buildContent() });
                 }
                 for (const tr of toolResults) {
                     messages.push(tr);
                 }
             } else if (parts.length > 0) {
-                // Regular message with mixed content
-                const content = parts.every(p => typeof p === 'string') 
-                    ? parts.join('\n') 
-                    : parts;
-                messages.push({ role: msg.role, content });
+                // Regular message with mixed content (text + images)
+                messages.push({ role: msg.role, content: buildContent() });
             }
         }
     }
@@ -173,6 +210,21 @@ function anthropicToOpenAI(anthropicReq) {
 // Add NVIDIA-specific parameters to request
 function addNvidiaParams(openaiReq) {
     openaiReq.chat_template_kwargs = { thinking: true };
+    return openaiReq;
+}
+
+// Add Kimi-specific parameters to request
+function addKimiParams(openaiReq) {
+    // Enable Kimi's native thinking/reasoning capability
+    openaiReq.thinking = { type: 'enabled' };
+    
+    // Per Kimi docs: when thinking is enabled, tool_choice can only be
+    // 'auto' or 'none'. Any other value causes an error.
+    if (openaiReq.tool_choice && openaiReq.tool_choice !== 'auto' && openaiReq.tool_choice !== 'none') {
+        console.log(`[MODEL-PROXY] Kimi: tool_choice '${JSON.stringify(openaiReq.tool_choice)}' → 'auto' (thinking mode restriction)`);
+        openaiReq.tool_choice = 'auto';
+    }
+    
     return openaiReq;
 }
 
@@ -262,6 +314,7 @@ const MODEL_REMAP = ENV_MODEL ? {
     openrouter: buildUniversalRemap(ENV_MODEL),
     doubleword: buildUniversalRemap(ENV_MODEL),
     nvidia:     buildUniversalRemap(ENV_MODEL),
+    moonshot:   buildUniversalRemap(ENV_MODEL),
     kimi:       buildUniversalRemap(ENV_MODEL),
 } : {
     // Fallback: hardcoded defaults (backward compatibility)
@@ -275,7 +328,8 @@ const MODEL_REMAP = ENV_MODEL ? {
     openrouter: buildUniversalRemap('deepseek/deepseek-v4-pro'),
     doubleword: buildUniversalRemap('moonshotai/Kimi-K2.6'),
     nvidia:     buildUniversalRemap('moonshotai/kimi-k2.6'),
-    kimi:       buildUniversalRemap('kimi-k2.6'),
+    moonshot:   buildUniversalRemap('kimi-k2.6'),
+    kimi:       buildUniversalRemap('kimi-for-coding'),
 };
 
 const PRICING_PER_M = {
@@ -284,7 +338,8 @@ const PRICING_PER_M = {
     fireworks:  { input: 1.74,  output: 3.48 },
     doubleword: { input: 0.44,  output: 0.87 },
     nvidia:     { input: 0.44,  output: 0.87 },
-    kimi:       { input: 0.44,  output: 0.87 },
+    moonshot:   { input: 0.44,  output: 0.87 },
+    kimi:       { input: 0.00,  output: 0.00 },  // Subscription-based
     anthropic:  { input: 3.00,  output: 15.00 },
     _single:    { input: 0.44,  output: 0.87 },
 };
@@ -660,6 +715,7 @@ function stripUnsignedThinkingBlocks(body) {
 export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends, defaultMode }) {
     return new Promise((resolve, reject) => {
         const initialTarget = new URL(targetUrl);
+        // Kimi Code (api.kimi.com) uses x-api-key (Anthropic-native), NOT Bearer
         const initialBearer = targetUrl.includes('openrouter') || targetUrl.includes('fireworks') || targetUrl.includes('doubleword.ai') || targetUrl.includes('nvidia.com') || targetUrl.includes('moonshot.ai');
 
         if (ENV_MODEL) {
@@ -668,9 +724,10 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
 
         // Auto-detect backend type from URL
         let detectedMode = '_single';
-        if (targetUrl.includes('doubleword.ai')) detectedMode = 'doubleword';
+        if (targetUrl.includes('api.kimi.com')) detectedMode = 'kimi';  // Kimi Code (Anthropic-native)
+        else if (targetUrl.includes('doubleword.ai')) detectedMode = 'doubleword';
         else if (targetUrl.includes('nvidia.com')) detectedMode = 'nvidia';
-        else if (targetUrl.includes('moonshot.ai')) detectedMode = 'kimi';
+        else if (targetUrl.includes('moonshot.ai')) detectedMode = 'moonshot';  // Moonshot Platform (OpenAI)
         else if (targetUrl.includes('openrouter')) detectedMode = 'openrouter';
         else if (targetUrl.includes('fireworks')) detectedMode = 'fireworks';
         else if (targetUrl.includes('deepseek')) detectedMode = 'deepseek';
@@ -681,6 +738,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 allBackends[name] = {
                     target: new URL(cfg.url),
                     apiKey: cfg.apiKey,
+                    // Kimi Code (api.kimi.com) uses x-api-key, NOT Bearer
                     useBearer: cfg.url.includes('openrouter') || cfg.url.includes('fireworks') || cfg.url.includes('doubleword.ai') || cfg.url.includes('nvidia.com') || cfg.url.includes('moonshot.ai'),
                 };
             }
@@ -868,6 +926,12 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     // Set proper content-type for OpenAI
                     headers['content-type'] = 'application/json';
                 }
+                
+                // Strip anthropic-beta for non-Anthropic backends using Anthropic format
+                // (Kimi Code returns 404 when prompt-caching beta header is present)
+                if (state.mode === 'kimi' || state.mode === 'deepseek') {
+                    delete headers['anthropic-beta'];
+                }
             }
 
             const chunks = [];
@@ -889,8 +953,15 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         if (mapped) {
                             console.log(`[MODEL-PROXY] #${reqId} model remap: ${parsed.model} → ${mapped}`);
                             parsed.model = mapped;
-                            body = Buffer.from(JSON.stringify(parsed));
                         }
+                        
+                        // Strip fields unsupported by Kimi Code
+                        // (Kimi returns 404 when 'metadata' is present)
+                        if (state.mode === 'kimi') {
+                            delete parsed.metadata;
+                        }
+                        
+                        body = Buffer.from(JSON.stringify(parsed));
                     } catch { /* not JSON or parse error, pass through */ }
                 }
 
@@ -927,9 +998,11 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         const anthropicReq = JSON.parse(body);
                         let openaiReq = anthropicToOpenAI(anthropicReq);
                         
-                        // Add NVIDIA-specific parameters
+                        // Add provider-specific parameters
                         if (state.mode === 'nvidia') {
                             openaiReq = addNvidiaParams(openaiReq);
+                        } else if (state.mode === 'moonshot') {
+                            openaiReq = addKimiParams(openaiReq);
                         }
                         
                         body = Buffer.from(JSON.stringify(openaiReq));

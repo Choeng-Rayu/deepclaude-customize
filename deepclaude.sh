@@ -27,7 +27,8 @@ fi
 declare -A PROVIDER_URLS=(
     [doubleword]="https://api.doubleword.ai/v1"
     [nvidia]="https://integrate.api.nvidia.com/v1"
-    [kimi]="https://api.moonshot.ai/v1"
+    [kimi]="https://api.kimi.com/coding/"
+    [moonshot]="https://api.moonshot.ai/v1"
     [deepseek]="https://api.deepseek.com/anthropic"
 )
 
@@ -58,6 +59,7 @@ case "$BACKEND" in
     dw) BACKEND="doubleword" ;;
     nv) BACKEND="nvidia" ;;
     ds) BACKEND="deepseek" ;;
+    ms) BACKEND="moonshot" ;;
 esac
 
 cleanup_proxy() {
@@ -88,9 +90,18 @@ resolve_backend() {
             model="${NVIDIA_MODEL:-moonshotai/Kimi-K2.6}"
             ;;
         kimi)
+            # Kimi Code — uses ANTHROPIC protocol natively (no OpenAI translation!)
+            # API keys from: https://www.kimi.com/code/console
             key="${KIMI_API_KEY:-}"
             url="${PROVIDER_URLS[kimi]}"
-            model="${KIMI_MODEL:-kimi-k2.6}"
+            model="${KIMI_MODEL:-kimi-for-coding}"
+            ;;
+        moonshot)
+            # Moonshot Platform — uses OpenAI protocol (needs translation)
+            # API keys from: https://platform.kimi.ai/console/api-keys
+            key="${MOONSHOT_API_KEY:-}"
+            url="${PROVIDER_URLS[moonshot]}"
+            model="${MOONSHOT_MODEL:-kimi-k2.6}"
             ;;
         deepseek)
             key="${DEEPSEEK_API_KEY:-}"
@@ -103,13 +114,13 @@ resolve_backend() {
             ;;
         *)
             echo "ERROR: Unknown provider '$BACKEND'" >&2
-            echo "  Supported: doubleword, nvidia, kimi, deepseek, anthropic" >&2
+            echo "  Supported: doubleword, nvidia, kimi, moonshot, deepseek, anthropic" >&2
             echo "  Set API_PROVIDER in proxy/.env or use -b flag" >&2
             exit 1
             ;;
     esac
 
-    [[ -z "$key" ]] && { echo "ERROR: ${BACKEND^^}_API_KEY not set in proxy/.env" >&2; exit 1; }
+    [[ -z "$key" ]] && { echo "ERROR: API key not set for '$BACKEND' in proxy/.env" >&2; exit 1; }
 
     RESOLVED_URL="$url"
     RESOLVED_KEY="$key"
@@ -117,13 +128,26 @@ resolve_backend() {
 }
 
 set_model_env() {
-    # Use the model from .env for all Claude Code model slots
-    export ANTHROPIC_DEFAULT_OPUS_MODEL="$RESOLVED_MODEL"
-    export ANTHROPIC_DEFAULT_SONNET_MODEL="$RESOLVED_MODEL"
-    export ANTHROPIC_DEFAULT_HAIKU_MODEL="$RESOLVED_MODEL"
-    export CLAUDE_CODE_SUBAGENT_MODEL="$RESOLVED_MODEL"
+    # For Anthropic-native backends (kimi, deepseek), Claude Code needs
+    # standard Claude model names — the proxy remaps them to the backend model.
+    # For OpenAI backends, we use the backend's model name directly since
+    # Claude Code doesn't validate those (they're translated by the proxy anyway).
+    local display_model="$RESOLVED_MODEL"
+    
+    case "$BACKEND" in
+        kimi|deepseek)
+            # These speak Anthropic protocol natively — Claude Code validates model names
+            # so we keep standard Claude names. The proxy remaps them.
+            display_model="claude-sonnet-4-6"
+            ;;
+    esac
+    
+    export ANTHROPIC_DEFAULT_OPUS_MODEL="$display_model"
+    export ANTHROPIC_DEFAULT_SONNET_MODEL="$display_model"
+    export ANTHROPIC_DEFAULT_HAIKU_MODEL="$display_model"
+    export CLAUDE_CODE_SUBAGENT_MODEL="$display_model"
     export CLAUDE_CODE_EFFORT_LEVEL="max"
-    # Pass model to proxy for dynamic remapping
+    # Pass actual backend model to proxy for dynamic remapping
     export CHEAPCLAUDE_MODEL="$RESOLVED_MODEL"
 }
 
@@ -138,12 +162,14 @@ show_status() {
     echo "  Providers:"
     echo "    doubleword  Key: $(mask_key "${DOUBLEWORD_API_KEY:-}")  Model: ${DOUBLEWORD_MODEL:-not set}"
     echo "    nvidia      Key: $(mask_key "${NVIDIA_API_KEY:-}")  Model: ${NVIDIA_MODEL:-not set}"
-    echo "    kimi        Key: $(mask_key "${KIMI_API_KEY:-}")  Model: ${KIMI_MODEL:-not set}"
+    echo "    kimi        Key: $(mask_key "${KIMI_API_KEY:-}")  Model: ${KIMI_MODEL:-not set}  (Anthropic-native)"
+    echo "    moonshot    Key: $(mask_key "${MOONSHOT_API_KEY:-}")  Model: ${MOONSHOT_MODEL:-not set}  (OpenAI)"
     echo "    deepseek    Key: $(mask_key "${DEEPSEEK_API_KEY:-}")  Model: ${DEEPSEEK_MODEL:-not set}"
     echo ""
     echo "  Usage:"
     echo "    ./deepclaude.sh              # Uses API_PROVIDER from .env"
-    echo "    ./deepclaude.sh -b nvidia    # Override with NVIDIA"
+    echo "    ./deepclaude.sh -b kimi      # Kimi Code (api.kimi.com)"
+    echo "    ./deepclaude.sh -b moonshot  # Moonshot Platform (api.moonshot.ai)"
     echo "    ./deepclaude.sh -b anthropic # Use native Claude"
     echo ""
     local proxy_status
@@ -272,7 +298,10 @@ launch_claude() {
 
     export ANTHROPIC_BASE_URL="http://127.0.0.1:$proxy_port"
     set_model_env
-    unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+    # Claude Code needs ANTHROPIC_API_KEY set to function.
+    # The proxy replaces it with the real backend key.
+    export ANTHROPIC_API_KEY="$RESOLVED_KEY"
+    unset ANTHROPIC_AUTH_TOKEN
 
     claude "$@"
 }

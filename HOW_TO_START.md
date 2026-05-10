@@ -12,7 +12,7 @@ export DOUBLEWORD_API_KEY="your api key"
 export NVIDIA_API_KEY="your-nvidia-key-here"
 
 # For Kimi / Moonshot AI Direct (Kimi K2.6)
-export KIMI_API_KEY="your-kimi-key-here"
+export MOONSHOT_API_KEY="your-moonshot-key-here"
 
 # For DeepSeek (DeepSeek V4 Pro, native Anthropic format)
 export DEEPSEEK_API_KEY="your-deepseek-key-here"
